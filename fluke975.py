@@ -167,19 +167,25 @@ def make_qd2(block_number: int):
     Build command to download one 256-byte data block.
 
     QD 2
-    + 4-byte big-endian block number
+    + selector byte 00
+    + 2-byte little-endian block number
+    + reserved byte 00
     + CR
     + CRC
     """
 
-    cmd = (
-        b"QD 2"
-        + struct.pack(
-            ">I",
-            block_number
+    if not 0 <= block_number <= 0xFFFF:
+        raise ValueError(
+            "QD 2 block number must be between 0 and 65535"
         )
-        + b"\r"
+
+    selector = (
+        b"\x00"
+        + struct.pack("<H", block_number)
+        + b"\x00"
     )
+
+    cmd = b"QD 2" + selector + b"\r"
 
     return add_crc(cmd)
 
@@ -300,7 +306,7 @@ def download_block(
 
       0\r                  2 bytes
       QD 2                 4 bytes
-      block number         4 bytes
+      block selector       4 bytes
       data                 256 bytes
       CRC                  2 bytes
 
@@ -326,7 +332,8 @@ def download_block(
         raise RuntimeError(
             f"Block {block_number}: "
             f"expected 268 bytes, "
-            f"received {len(response)}"
+            f"received {len(response)}; "
+            f"response={response.hex(' ')}"
         )
 
     if not response.startswith(
@@ -347,18 +354,20 @@ def download_block(
         )
 
     #
-    # Verify returned block number too.
+    # The instrument echoes the four selector bytes. Verify them too.
     #
-    returned_block = struct.unpack(
-        ">I",
-        response[6:10]
-    )[0]
+    expected_selector = (
+        b"\x00"
+        + struct.pack("<H", block_number)
+        + b"\x00"
+    )
+    returned_selector = response[6:10]
 
-    if returned_block != block_number:
+    if returned_selector != expected_selector:
         raise RuntimeError(
-            f"Block mismatch: "
-            f"requested {block_number}, "
-            f"received {returned_block}"
+            f"Block selector mismatch: "
+            f"requested {expected_selector.hex(' ')}, "
+            f"received {returned_selector.hex(' ')}"
         )
 
     #
