@@ -50,12 +50,7 @@ def verify_crc(data: bytes) -> bool:
         return False
 
     payload = data[:-2]
-
-    received_crc = struct.unpack(
-        "<H",
-        data[-2:]
-    )[0]
-
+    received_crc = struct.unpack("<H", data[-2:])[0]
     calculated_crc = crc16_modbus(payload)
 
     return received_crc == calculated_crc
@@ -72,6 +67,24 @@ def bcd(value: int) -> int:
       0x49 -> 49
     """
     return ((value >> 4) * 10) + (value & 0x0F)
+
+
+def decode_timestamp(raw: bytes) -> datetime:
+    """
+    Decode Fluke timestamp:
+      HH MM SS DD MM YY
+    """
+    if len(raw) != 6:
+        raise ValueError("Timestamp must be exactly 6 bytes")
+
+    return datetime(
+        2000 + bcd(raw[5]),
+        bcd(raw[4]),
+        bcd(raw[3]),
+        bcd(raw[0]),
+        bcd(raw[1]),
+        bcd(raw[2])
+    )
 
 
 def read_response(
@@ -91,9 +104,7 @@ def read_response(
         waiting = ser.in_waiting
 
         if waiting:
-            data.extend(
-                ser.read(waiting)
-            )
+            data.extend(ser.read(waiting))
 
             if (
                 expected_length is not None
@@ -114,7 +125,6 @@ def send_simple_command(
     timeout=2.0
 ):
     ser.reset_input_buffer()
-
     ser.write(command)
     ser.flush()
 
@@ -155,25 +165,20 @@ def get_id(ser):
 
 def make_qd0():
     """
-    Query log metadata.
+    Query the session directory / log metadata.
     """
-    return add_crc(
-        b"QD 0\r"
-    )
+    return add_crc(b"QD 0\r")
 
 
 def make_qd2(block_number: int):
     """
     Build command to download one 256-byte data block.
 
-    QD 2
-    + selector byte 00
-    + 2-byte little-endian block number
-    + reserved byte 00
-    + CR
-    + CRC
+    Observed selector layout:
+      00
+      block_number uint16 little-endian
+      00
     """
-
     if not 0 <= block_number <= 0xFFFF:
         raise ValueError(
             "QD 2 block number must be between 0 and 65535"
@@ -191,29 +196,48 @@ def make_qd2(block_number: int):
 
 
 # ----------------------------------------------------------------------
-# Log metadata
+# Session directory (QD 0)
 # ----------------------------------------------------------------------
 
-def get_log_info(ser):
+def get_sessions(ser):
     """
-    Query QD 0 metadata.
+    Read and parse the complete QD 0 session directory.
 
-    Observed reply:
+    Observed QD 0 response:
+      0\r                    2 bytes
+      QD 0                   4 bytes
+      session_count          1 byte
+      session entries        16 bytes each
+      CRC                    2 bytes
 
-      0\r
-      QD 0
-      01
-      HH MM SS DD MM YY
-      00 00 00 00
-      record_count (4-byte little-endian)
-      00 00
-      CRC
+    Each 16-byte session entry:
+      timestamp              6 bytes, BCD HH MM SS DD MM YY
+      start_address          4 bytes, little-endian
+      record_count           4 bytes, little-endian
+      unknown                2 bytes
+
+    Example observed with three sessions:
+      count = 03
+
+      session 1:
+        timestamp = 2026-08-23 17:35:07
+        address   = 0x00000000
+        records   = 31
+
+      session 2:
+        timestamp = 2026-08-23 17:40:49
+        address   = 0x00000400
+        records   = 31
+
+      session 3:
+        timestamp = 2026-08-23 17:47:16
+        address   = 0x00000800
+        records   = 31
     """
 
     cmd = make_qd0()
 
     ser.reset_input_buffer()
-
     ser.write(cmd)
     ser.flush()
 
@@ -222,73 +246,84 @@ def get_log_info(ser):
         timeout=2.0
     )
 
-    if not response.startswith(
-        b"0\rQD 0"
-    ):
+    if not response.startswith(b"0\rQD 0"):
         raise RuntimeError(
             "Unexpected QD 0 response:\n"
             + response.hex(" ")
         )
 
-    #
-    # IMPORTANT:
-    # Response CRC covers the COMPLETE response,
-    # including initial status bytes 0\r.
-    #
     if not verify_crc(response):
         raise RuntimeError(
             "QD 0 CRC check failed"
         )
 
-    #
-    # Skip:
-    # 0\r      = 2 bytes
-    # QD 0     = 4 bytes
-    #
     payload = response[6:-2]
 
-    if len(payload) < 17:
+    if len(payload) < 1:
         raise RuntimeError(
-            f"QD 0 payload too short: "
-            f"{len(payload)} bytes"
+            "QD 0 payload is empty"
         )
 
-    log_type = payload[0]
+    session_count = payload[0]
 
-    timestamp_raw = payload[1:7]
+    expected_payload_length = 1 + session_count * 16
 
-    try:
-        timestamp = datetime(
-            2000 + bcd(timestamp_raw[5]),
-            bcd(timestamp_raw[4]),
-            bcd(timestamp_raw[3]),
-            bcd(timestamp_raw[0]),
-            bcd(timestamp_raw[1]),
-            bcd(timestamp_raw[2])
+    if len(payload) != expected_payload_length:
+        raise RuntimeError(
+            "Unexpected QD 0 payload length: "
+            f"session_count={session_count}, "
+            f"expected {expected_payload_length} bytes, "
+            f"received {len(payload)} bytes.\n"
+            f"Raw response: {response.hex(' ')}"
         )
 
-    except ValueError as e:
-        raise RuntimeError(
-            "Invalid timestamp in QD 0 response"
-        ) from e
+    sessions = []
 
-    #
-    # Four zero bytes follow timestamp.
-    #
-    # record_count therefore starts at offset 11.
-    #
-    record_count = struct.unpack_from(
-        "<I",
-        payload,
-        11
-    )[0]
+    for i in range(session_count):
 
-    return {
-        "log_type": log_type,
-        "timestamp": timestamp,
-        "record_count": record_count,
-        "raw": response
-    }
+        offset = 1 + i * 16
+        entry = payload[offset:offset + 16]
+
+        timestamp_raw = entry[0:6]
+
+        try:
+            timestamp = decode_timestamp(timestamp_raw)
+        except ValueError as e:
+            raise RuntimeError(
+                f"Invalid timestamp in session {i + 1}"
+            ) from e
+
+        start_address = struct.unpack_from(
+            "<I",
+            entry,
+            6
+        )[0]
+
+        record_count = struct.unpack_from(
+            "<I",
+            entry,
+            10
+        )[0]
+
+        unknown = entry[14:16]
+
+        if start_address % 256 != 0:
+            raise RuntimeError(
+                f"Session {i + 1}: start address "
+                f"0x{start_address:08x} is not aligned "
+                "to a 256-byte QD 2 block"
+            )
+
+        sessions.append({
+            "session": i + 1,
+            "timestamp": timestamp,
+            "start_address": start_address,
+            "start_block": start_address // 256,
+            "record_count": record_count,
+            "unknown_hex": unknown.hex()
+        })
+
+    return sessions
 
 
 # ----------------------------------------------------------------------
@@ -303,7 +338,6 @@ def download_block(
     Download one 256-byte block.
 
     Expected response:
-
       0\r                  2 bytes
       QD 2                 4 bytes
       block selector       4 bytes
@@ -313,12 +347,9 @@ def download_block(
     Total: 268 bytes
     """
 
-    cmd = make_qd2(
-        block_number
-    )
+    cmd = make_qd2(block_number)
 
     ser.reset_input_buffer()
-
     ser.write(cmd)
     ser.flush()
 
@@ -336,31 +367,23 @@ def download_block(
             f"response={response.hex(' ')}"
         )
 
-    if not response.startswith(
-        b"0\rQD 2"
-    ):
+    if not response.startswith(b"0\rQD 2"):
         raise RuntimeError(
             f"Block {block_number}: "
-            f"unexpected response header"
+            "unexpected response header"
         )
 
-    #
-    # CRC is calculated across entire response,
-    # excluding only final CRC bytes.
-    #
     if not verify_crc(response):
         raise RuntimeError(
             f"Block {block_number}: CRC error"
         )
 
-    #
-    # The instrument echoes the four selector bytes. Verify them too.
-    #
     expected_selector = (
         b"\x00"
         + struct.pack("<H", block_number)
         + b"\x00"
     )
+
     returned_selector = response[6:10]
 
     if returned_selector != expected_selector:
@@ -370,25 +393,17 @@ def download_block(
             f"received {returned_selector.hex(' ')}"
         )
 
-    #
-    # 256-byte payload:
-    #
-    data = response[10:266]
-
-    return data
+    return response[10:266]
 
 
 # ----------------------------------------------------------------------
 # Record parsing
 # ----------------------------------------------------------------------
 
-def parse_record(
-    data: bytes
-):
+def parse_record(data: bytes):
     """
     Parse one 32-byte logged measurement record.
     """
-
     if len(data) != 32:
         raise ValueError(
             "Record must be exactly 32 bytes"
@@ -406,30 +421,14 @@ def parse_record(
         2
     )[0]
 
-    #
     # Empty/unused record
-    #
     if record_number == 0:
         return None
 
-    hour = bcd(data[4])
-    minute = bcd(data[5])
-    second = bcd(data[6])
-
-    day = bcd(data[7])
-    month = bcd(data[8])
-    year = 2000 + bcd(data[9])
-
     try:
-        timestamp = datetime(
-            year,
-            month,
-            day,
-            hour,
-            minute,
-            second
+        timestamp = decode_timestamp(
+            data[4:10]
         )
-
     except ValueError:
         timestamp = None
 
@@ -486,44 +485,39 @@ def parse_record(
 
 
 # ----------------------------------------------------------------------
-# Complete download
+# Session download
 # ----------------------------------------------------------------------
 
-def download_records(
-    ser,
-    record_count
-):
+def download_session(ser, session):
     """
-    Download all records.
+    Download one complete session.
 
-    One block:
-      256 bytes
-
-    One record:
-      32 bytes
-
-    Therefore:
-      8 records per block.
+    The session's own start address and record count are used, so sessions
+    may have different lengths and do not need to be contiguous.
     """
+    record_count = session["record_count"]
+    start_block = session["start_block"]
 
-    blocks = math.ceil(
-        record_count / 8
-    )
+    if record_count == 0:
+        return []
+
+    blocks = math.ceil(record_count / 8)
 
     records = []
 
     print(
-        f"Downloading {record_count} records "
-        f"from {blocks} blocks..."
+        f"Downloading session {session['session']}: "
+        f"{record_count} records from {blocks} block(s), "
+        f"starting at block {start_block}..."
     )
 
-    for block_number in range(
-        blocks
-    ):
+    for relative_block in range(blocks):
+
+        block_number = start_block + relative_block
 
         print(
-            f"Block "
-            f"{block_number + 1}/{blocks}",
+            f"  Block {relative_block + 1}/{blocks} "
+            f"(absolute block {block_number})",
             end="\r",
             flush=True
         )
@@ -535,11 +529,9 @@ def download_records(
 
         for index in range(8):
 
-            start = index * 32
-            end = start + 32
-
             raw_record = block[
-                start:end
+                index * 32:
+                (index + 1) * 32
             ]
 
             record = parse_record(
@@ -549,23 +541,29 @@ def download_records(
             if record is None:
                 continue
 
-            records.append(
-                record
-            )
+            row = record.copy()
+            row["session"] = session["session"]
+            row["session_start"] = session["timestamp"]
+            row["session_start_address"] = session["start_address"]
+            row["session_record_count"] = session["record_count"]
 
-            if (
-                len(records)
-                >= record_count
-            ):
+            records.append(row)
+
+            if len(records) >= record_count:
                 break
 
-        if (
-            len(records)
-            >= record_count
-        ):
+        if len(records) >= record_count:
             break
 
     print()
+
+    if len(records) != record_count:
+        print(
+            f"WARNING: Session {session['session']} reported "
+            f"{record_count} records, but {len(records)} "
+            "records were decoded.",
+            file=sys.stderr
+        )
 
     return records
 
@@ -574,12 +572,13 @@ def download_records(
 # CSV
 # ----------------------------------------------------------------------
 
-def write_csv(
-    filename,
-    records
-):
+def write_csv(filename, records):
 
     fields = [
+        "session",
+        "session_start",
+        "session_start_address",
+        "session_record_count",
         "record",
         "timestamp",
         "temperature_c",
@@ -610,12 +609,16 @@ def write_csv(
 
             row = record.copy()
 
+            if row["session_start"]:
+                row["session_start"] = (
+                    row["session_start"]
+                    .strftime("%Y-%m-%d %H:%M:%S")
+                )
+
             if row["timestamp"]:
                 row["timestamp"] = (
                     row["timestamp"]
-                    .strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    )
+                    .strftime("%Y-%m-%d %H:%M:%S")
                 )
 
             writer.writerow({
@@ -632,7 +635,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Download logged data "
+            "Download all logged sessions "
             "from a Fluke 975 AirMeter"
         )
     )
@@ -670,20 +673,9 @@ def main():
         timeout=0.1
     ) as ser:
 
-        #
         # Identification
-        #
-        id_response = get_id(
-            ser
-        )
+        id_response = get_id(ser)
 
-        #
-        # ID format observed:
-        #
-        # 0\r
-        # FLUKE 975, 1C , 93870022  \r
-        # CRC
-        #
         id_payload = id_response[2:-2]
 
         id_text = (
@@ -700,101 +692,96 @@ def main():
             f"Instrument: {id_text}"
         )
 
-        #
-        # Metadata
-        #
-        info = get_log_info(
-            ser
-        )
+        # Session directory
+        sessions = get_sessions(ser)
 
+        print()
         print(
-            "Log start:",
-            info["timestamp"]
-            .strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+            f"Sessions found: {len(sessions)}"
         )
 
-        print(
-            "Records:",
-            info["record_count"]
-        )
-
-        if info["record_count"] == 0:
-
+        if not sessions:
             print(
-                "No logged records "
-                "found in instrument."
+                "No logged sessions found in instrument."
             )
-
             return
 
-        #
-        # Download all records
-        #
-        records = download_records(
-            ser,
-            info["record_count"]
-        )
+        print()
 
+        for session in sessions:
+
+            print(
+                f"Session {session['session']:3d}: "
+                f"{session['timestamp']:%Y-%m-%d %H:%M:%S}  "
+                f"records={session['record_count']:5d}  "
+                f"address=0x{session['start_address']:08x}  "
+                f"block={session['start_block']}"
+            )
+
+        print()
+
+        # Download every session
+        all_records = []
+
+        for session in sessions:
+
+            records = download_session(
+                ser,
+                session
+            )
+
+            all_records.extend(
+                records
+            )
+
+    print()
     print(
-        f"Downloaded "
-        f"{len(records)} records"
+        f"Downloaded {len(all_records)} records "
+        f"from {len(sessions)} session(s)"
     )
 
-    #
-    # Sanity check
-    #
-    if (
-        len(records)
-        != info["record_count"]
-    ):
-
-        print(
-            "WARNING: Instrument reported "
-            f"{info['record_count']} records, "
-            f"but {len(records)} were decoded.",
-            file=sys.stderr
-        )
-
-    #
-    # Show first few
-    #
+    # Show first few records from each session
     print()
 
-    for record in records[:5]:
+    for session in sessions:
 
-        timestamp = (
-            record["timestamp"]
-            .strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-            if record["timestamp"]
-            else "INVALID"
-        )
+        session_records = [
+            r for r in all_records
+            if r["session"] == session["session"]
+        ]
 
         print(
-            f'{record["record"]:5d}  '
-            f'{timestamp}  '
-            f'{record["temperature_c"]:5.1f} °C  '
-            f'{record["rh_percent"]:6.2f} %RH  '
-            f'CO={record["co_ppm"]} ppm  '
-            f'CO2={record["co2_ppm"]} ppm'
+            f"Session {session['session']}:"
         )
 
-    if len(records) > 5:
-        print("...")
+        for record in session_records[:3]:
 
-    #
-    # Save CSV
-    #
+            timestamp = (
+                record["timestamp"]
+                .strftime("%Y-%m-%d %H:%M:%S")
+                if record["timestamp"]
+                else "INVALID"
+            )
+
+            print(
+                f'  {record["record"]:5d}  '
+                f'{timestamp}  '
+                f'{record["temperature_c"]:5.1f} °C  '
+                f'{record["rh_percent"]:6.2f} %RH  '
+                f'CO={record["co_ppm"]} ppm  '
+                f'CO2={record["co2_ppm"]} ppm'
+            )
+
+        if len(session_records) > 3:
+            print("  ...")
+
+    # Save combined CSV
     write_csv(
         args.output,
-        records
+        all_records
     )
 
     print()
-
     print(
         f"Saved to {args.output}"
     )
